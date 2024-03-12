@@ -19,7 +19,7 @@ class Sender:
         self.socket.bind(('0.0.0.0', 0))
         self.waiting = False
         self.RTT = 1 #given value
-        self.send_buffer = SendBuffer(4) # set the send buffer with max window size of 5
+        self.send_buffer = SendBuffer(5) # set the send buffer with max window size of 4
         self.sentPacketTimers = {}
         self.RTT_backoff = 1
         self.retransmitted_packets = set()
