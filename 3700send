@@ -1,0 +1,189 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, datetime, json, select, struct, sys, math, hashlib
+from send_buffer import SendBuffer
+
+DATA_SIZE = 1375
+TCP_TIMEOUT_WEIGHT = 0.875
+RTT_multiplier = 1.75
+
+# represents a sender in the TCP data exchange (server)
+class Sender:
+    RTT: float # to allow some multiplication and divisions
+
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+        self.RTT = 1 #given value
+        self.send_buffer = SendBuffer(5) # set the send buffer with max window size of 5
+        self.sentPacketTimers = {}
+        self.RTT_backoff = 1
+        self.retransmitted_packets = set()
+        self.all_data_sent = False
+
+    # log a message in the standard error stream(stderr)
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # added code for sendPacketTimer
+    def send(self, message, seq_num):
+        sent_time = datetime.datetime.now()
+        expiry_time = self.RTT * self.RTT_backoff * RTT_multiplier
+        # set the timer using the calculated information
+        self.sentPacketTimers[seq_num] = (sent_time, self.RTT_backoff, expiry_time)
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    # creates a message dictionary
+    def create_message(self, seq_num, data):
+        # create a checksum using a unique hash based on the message contents
+        checksum = hashlib.md5((str(seq_num) + data).encode('utf-8')).hexdigest()
+        # return a message dictionary with a header, a body, and a checksum
+        return {"header": {"sno": seq_num}, "body": {"type": "msg", "data": data}, "checksum": checksum}
+
+    # returns True if message has expired
+    def expired_msg(self, sent_time, RTT_factor, expiry_time):
+        return (datetime.datetime.now() - sent_time).total_seconds() > expiry_time
+
+    # sends packets past the expiry time
+    def resend_expired_data(self):
+        resent_packets = []
+        # for each sent packet
+        for seq_no, timer in self.sentPacketTimers.items():
+            # if the packet has expired
+            if self.expired_msg(*timer):
+                # and there is data that needs to be sent
+                data = self.send_buffer.get_data_of_seq_num(seq_no)
+                if data:
+                    # resend the necessary data
+                    self.log(f"Retransmitting {seq_no}")
+                    msg = self.create_message(seq_no, data)
+                    self.retransmitted_packets.add(seq_no)
+                    self.send(msg, seq_no)
+                    resent_packets.append(seq_no)
+        # make adjustments for resending
+        if resent_packets:
+            self.send_buffer.multiplicative_decrease()
+            self.RTT_backoff *= 2
+
+    def expiry_reset(self):
+        current_time = datetime.datetime.now()
+        # for each sent packet
+        for seq_num, (time_sent, RTT_backoff_during_send, _) in self.sentPacketTimers.items():
+            time_since_sent = (current_time - time_sent).total_seconds()
+            # if sending has gone past 1(RTT time), it is expired
+            if RTT_backoff_during_send > 1:
+                # calculate the new expiry time based on the RTT factor and time since the packet was sent
+                new_expiry_time = (RTT_multiplier * self.RTT * self.RTT_backoff) - time_since_sent
+                # update the expiry time
+                self.sentPacketTimers[seq_num] = (time_sent, RTT_backoff_during_send, new_expiry_time)
+
+
+    # removes packets that have been received but not acknowledged to prevent them from being retransmitted and saving time
+    def remove_unacked_packets(self, msg_sack):
+        for sack in msg_sack:
+            if sack in self.sentPacketTimers:
+                # remove unacknowledged packet
+                del self.sentPacketTimers[sack]
+                # update the acknowledgement number
+                self.send_buffer.update_ack(sack)
+
+    # recalculates the Round Trip Time of packets
+    def recalculate_RTT(self, sent_time):
+        # calculate the RTT of the packet
+        packetRTT = (datetime.datetime.now() - sent_time).total_seconds()
+        current_estimate = TCP_TIMEOUT_WEIGHT * self.RTT
+        # calculate the difference between the newfound RTT and the current estimate
+        difference = packetRTT - current_estimate
+        # update the RTT calculations by adding the weighted difference
+        self.RTT = current_estimate + (1 - TCP_TIMEOUT_WEIGHT) * difference
+
+    # send new data over the network
+    def send_new_data(self, data: str = ""):
+        # if data is provided, just add it to the send buffer
+        if data:
+            self.send_buffer.add_data(data)
+        data_to_send = self.send_buffer.get_data_to_send()
+        # if no data is provided, but all data hasn't been acknowledged, set waiting to true
+        if not data_to_send and not self.send_buffer.all_data_acked():
+            self.waiting = True
+            return
+        #create and send every message that needs to be sent
+        for seq_num, data in data_to_send:
+            send_msg = self.create_message(seq_num, data)
+            self.send(send_msg, seq_num)
+
+    # quit if all data has been acknowledged
+    def try_to_exit(self):
+        if self.send_buffer.all_data_acked():
+            self.log("All data sucessfully acknowledged")
+            sys.exit(0)
+
+    def run(self):
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            socks = select.select(sockets, [], [], 0.1)[0]
+
+            # added error checking for expired packets 
+            if not socks:
+                self.resend_expired_data()
+                continue
+
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    # added message drops for broken json
+                    try:
+                        msg = json.loads(msg)
+                    except ValueError:
+                        self.log("Dropping broken json")
+                        continue
+                    
+                    msg_seq_num = msg["header"]["sno"]
+                    msg_sack = msg["header"]["sack"]
+                    self.log("Received message '%s'" % msg)
+
+                    # if the sequence number is in the sent packet timers
+                    if msg_seq_num in self.sentPacketTimers:
+                        #update the acknowledgement number in the send buffer
+                        self.send_buffer.update_ack(msg_seq_num)
+                        # if the sequence number has not been retransmitted, then adjust for the bad network
+                        if msg_seq_num not in self.retransmitted_packets:
+                            self.recalculate_RTT(self.sentPacketTimers[msg_seq_num][0])
+                            self.RTT_backoff = 1
+                            self.expiry_reset()
+                        # delete the sequence number from the packet timer records
+                        del self.sentPacketTimers[msg_seq_num]
+                        self.send_buffer.additive_increase()
+                        self.waiting = False
+                        self.remove_unacked_packets(msg_sack)
+                        self.resend_expired_data()
+                        self.send_new_data()
+
+                    if self.all_data_sent:
+                        self.try_to_exit()
+
+                elif conn == sys.stdin:
+
+                    data = sys.stdin.read(DATA_SIZE)
+                    if len(data) == 0:
+                        self.all_data_sent = True
+                        self.try_to_exit()
+                        continue
+
+                    self.resend_expired_data()
+                    self.send_new_data(data)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()

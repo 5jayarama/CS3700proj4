@@ -1,0 +1,98 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, hashlib
+from recv_buffer import RecvBuffer
+
+
+# represents a receiver within a TCP data exchange (client)
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        self.expected_packet = 0 # added
+        self.recv_buffer = RecvBuffer() # added
+
+        self.remote_host = None
+        self.remote_port = None
+
+    # sends a message over a UDP socket to a remote host
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    # log a message in the standard error stream(stderr)
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # returns true if the message is not corrupted
+    def validate_checksum(self, seq_num, data, checksum):
+        # takes in the sequence number, the message data, and the checksum to verify against
+        return hashlib.md5((str(seq_num) + data).encode('utf-8')).hexdigest() == checksum
+
+    # prints the received data
+    def print_data(self, packet):
+        if packet:
+            for seq_num, data in packet:
+                print(data, end="")
+            self.expected_packet = 1 + packet[len(packet) - 1][0]
+        else:
+            return
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't alreadt have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                # added message drops during the message decoding part
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                except ValueError:
+                    self.log("Dropping broken json")
+                    continue
+                if not msg:
+                    self.log("Dropping broken json")
+                    continue
+                if "header" not in msg or "sno" not in msg["header"]:
+                    self.log("Dropping broken json")
+                    continue
+
+                if "body" not in msg or "data" not in msg["body"]:
+                    self.log("Dropping broken json")
+                    continue
+
+                msg_seq_num = msg["header"]["sno"]
+                msg_data = msg["body"]["data"]
+                checksum = msg.get("checksum")
+
+                if not checksum or not self.validate_checksum(msg_seq_num, msg_data, checksum):
+                    self.log("Dropping broken json")
+                    continue
+                self.log("Received data message %s" % msg)
+
+                # remade the data print and send acknowledgement
+                if msg_seq_num == self.expected_packet:
+                    self.expected_packet += 1
+                    self.recv_buffer.add(msg_seq_num, msg_data)
+                    # send acknowledgement. Original code: self.send({ "type": "ack" })
+                    self.send({"header": {"sno": msg_seq_num, "sack": []}, "body": {"type": "ack"}})
+                    # if packet is not empty, print the data
+                    self.print_data(self.recv_buffer.flush())
+                else:
+                    self.recv_buffer.add(msg_seq_num, msg_data)
+                    # send acknowledgement with sack
+                    self.send({"header": {"sno": msg_seq_num, "sack": self.recv_buffer.get_received_seq_nums()},
+                               "body": {"type": "ack"}})
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
