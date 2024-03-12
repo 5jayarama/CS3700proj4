@@ -19,7 +19,7 @@ class Sender:
         self.socket.bind(('0.0.0.0', 0))
         self.waiting = False
         self.RTT = 1 #given value
-        self.send_buffer = SendBuffer(5) # set the send buffer with max window size of 5
+        self.send_buffer = SendBuffer(4) # set the send buffer with max window size of 5
         self.sentPacketTimers = {}
         self.RTT_backoff = 1
         self.retransmitted_packets = set()
@@ -53,23 +53,24 @@ class Sender:
     def resend_expired_data(self):
         resent_packets = []
         # for each sent packet
-        for seq_no, timer in self.sentPacketTimers.items():
+        for seq_num, timer in self.sentPacketTimers.items():
             # if the packet has expired
             if self.expired_msg(*timer):
                 # and there is data that needs to be sent
-                data = self.send_buffer.get_data_of_seq_num(seq_no)
+                data = self.send_buffer.get_data_of_seq_num(seq_num)
                 if data:
                     # resend the necessary data
-                    self.log(f"Retransmitting {seq_no}")
-                    msg = self.create_message(seq_no, data)
-                    self.retransmitted_packets.add(seq_no)
-                    self.send(msg, seq_no)
-                    resent_packets.append(seq_no)
+                    self.log(f"Retransmitting {seq_num}")
+                    msg = self.create_message(seq_num, data)
+                    self.retransmitted_packets.add(seq_num)
+                    self.send(msg, seq_num)
+                    resent_packets.append(seq_num)
         # make adjustments for resending
         if resent_packets:
             self.send_buffer.multiplicative_decrease()
             self.RTT_backoff *= 2
 
+    # reset the expiry 
     def expiry_reset(self):
         current_time = datetime.datetime.now()
         # for each sent packet
@@ -97,10 +98,8 @@ class Sender:
         # calculate the RTT of the packet
         packetRTT = (datetime.datetime.now() - sent_time).total_seconds()
         current_estimate = TCP_TIMEOUT_WEIGHT * self.RTT
-        # calculate the difference between the newfound RTT and the current estimate
-        difference = packetRTT - current_estimate
         # update the RTT calculations by adding the weighted difference
-        self.RTT = current_estimate + (1 - TCP_TIMEOUT_WEIGHT) * difference
+        self.RTT = current_estimate + (1 - TCP_TIMEOUT_WEIGHT) * packetRTT
 
     # send new data over the network
     def send_new_data(self, data: str = ""):
@@ -118,7 +117,7 @@ class Sender:
             self.send(send_msg, seq_num)
 
     # quit if all data has been acknowledged
-    def try_to_exit(self):
+    def exit_if_done(self):
         if self.send_buffer.all_data_acked():
             self.log("All data sucessfully acknowledged")
             sys.exit(0)
@@ -132,8 +131,9 @@ class Sender:
             if not socks:
                 self.resend_expired_data()
                 continue
-
+            
             for conn in socks:
+                # if data is coming from socket
                 if conn == self.socket:
                     k, addr = conn.recvfrom(65535)
                     msg = k.decode('utf-8')
@@ -164,18 +164,19 @@ class Sender:
                         self.remove_unacked_packets(msg_sack)
                         self.resend_expired_data()
                         self.send_new_data()
-
+                    
                     if self.all_data_sent:
-                        self.try_to_exit()
+                        self.exit_if_done()
 
+                # if data is coming from standard input
                 elif conn == sys.stdin:
-
+                    # read the data
                     data = sys.stdin.read(DATA_SIZE)
                     if len(data) == 0:
                         self.all_data_sent = True
-                        self.try_to_exit()
+                        self.exit_if_done()
                         continue
-
+                    # send expired data and new data
                     self.resend_expired_data()
                     self.send_new_data(data)
 
